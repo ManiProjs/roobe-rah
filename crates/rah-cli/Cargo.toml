@@ -1,0 +1,18 @@
+[package]
+name = "rah-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rah"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+rah-core = { path = "../rah-core" }
+rah-config = { path = "../rah-config" }
+toml = "1.1.5"

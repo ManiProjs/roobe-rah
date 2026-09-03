@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/rah-core", "crates/rah-config", "crates/rah-cli"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
