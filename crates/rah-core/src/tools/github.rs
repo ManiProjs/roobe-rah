@@ -131,6 +131,7 @@ impl GitHubBackend {
         let mut response = self
             .client
             .get(&asset.browser_download_url)
+            .header("Accept", "application/octet-stream")
             .header("X-GitHub-Api-Version", API_VERSION)
             .send()
             .await
@@ -144,11 +145,50 @@ impl GitHubBackend {
             );
         }
 
-        let mut file = tokio::fs::File::create(&archive).await?;
+        let total_size = response.content_length();
+
+        let progress = match total_size {
+            Some(total) => indicatif::ProgressBar::new(total),
+            None => indicatif::ProgressBar::new_spinner(),
+        };
+
+        progress.set_style(
+            indicatif::ProgressStyle::with_template(
+                "{spinner:.green} {msg} {bar:30} {bytes}/{total_bytes} ({percent}%)",
+            )?
+            .progress_chars("█▓░")
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+        );
+
+        progress.set_message(format!("Downloading {}", asset.name));
+
+        let mut file = tokio::fs::File::create(&archive)
+            .await
+            .with_context(|| format!("failed to create {}", archive.display()))?;
 
         while let Some(chunk) = response.chunk().await? {
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+
+            progress.inc(chunk.len() as u64);
+
+            // For responses without Content-Length, indicatif's spinner
+            // still needs to be refreshed.
+            if total_size.is_none() {
+                progress.set_message(format!(
+                    "Downloading {}  {}",
+                    asset.name,
+                    format_bytes(progress.position()),
+                ));
+
+                progress.tick();
+            }
         }
+
+        progress.finish_with_message(format!(
+            "Downloaded {} ({})",
+            asset.name,
+            format_bytes(progress.position()),
+        ));
 
         Ok(archive)
     }
@@ -179,6 +219,24 @@ impl GitHubBackend {
         }
 
         bail!("unsupported archive format `{name}`");
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+
+    let mut size = bytes as f64;
+    let mut unit = 0;
+
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{:.1} {}", size, UNITS[unit])
     }
 }
 

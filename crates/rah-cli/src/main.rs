@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use console::Style;
 
 use crate::helpers::{failure, print_header, spinner, success};
-use console::Style;
 use rah_config::add_tool;
 use rah_core::{project::Project, tools::ToolRequirement};
 
@@ -244,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Prune => command_prune(),
 
-        Commands::Env(args) => command_env(args),
+        Commands::Env(args) => command_env(args).await,
 
         Commands::Activate(args) => command_activate(args).await,
 
@@ -428,27 +428,33 @@ async fn command_exec(args: ExecArgs) -> Result<()> {
 
     let project = Project::discover(".").context("could not find a project")?;
 
-    let requirements = discover_project_tools()?;
-
     let requirements = if let Some(tool) = args.tool {
         vec![ToolRequirement::parse(&tool)?]
     } else {
-        requirements
+        discover_project_tools()?
     };
 
-    let environment = rah_core::tools::environment::resolve_environment(&requirements).await?;
+    let environment = rah_core::tools::environment::ensure_environment(&requirements).await?;
 
-    let mut command = std::process::Command::new(&args.command[0]);
+    let command_name = &args.command[0];
+
+    let executable = environment
+        .executables
+        .get(command_name)
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(command_name));
+
+    let mut command = std::process::Command::new(&executable);
 
     command.args(&args.command[1..]).current_dir(&project.root);
 
-    for (key, value) in environment {
+    for (key, value) in environment.variables {
         command.env(key, value);
     }
 
     let status = command
         .status()
-        .with_context(|| format!("failed to execute `{}`", args.command[0]))?;
+        .with_context(|| format!("failed to execute `{}`", executable.display()))?;
 
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -529,66 +535,133 @@ fn command_prune() -> Result<()> {
     Ok(())
 }
 
-fn command_env(args: EnvArgs) -> Result<()> {
+async fn command_env(args: EnvArgs) -> Result<()> {
+    let requirements = match discover_project_tools() {
+        Ok(requirements) => requirements,
+        Err(error) => {
+            if args.json {
+                return Err(error);
+            }
+
+            if let Some(shell) = &args.shell {
+                let output = rah_core::tools::environment::shell_environment(&[], shell)?;
+
+                print!("{output}");
+                return Ok(());
+            }
+
+            return Err(error);
+        }
+    };
+
+    let environment = rah_core::tools::environment::resolve_environment(&requirements)?;
+
     if args.json {
-        println!("{{");
-        println!("  \"environment\": {{");
-        println!("  }}");
-        println!("}}");
+        println!("{}", serde_json::to_string_pretty(&environment)?);
 
         return Ok(());
     }
 
     if let Some(shell) = args.shell {
-        println!("# Rah environment for {shell}");
+        let output = rah_core::tools::environment::shell_environment(&requirements, &shell)?;
 
-        // TODO: Generate shell-compatible exports.
+        print!("{output}");
 
         return Ok(());
     }
 
-    // TODO: Build and display resolved environment.
+    for (key, value) in &environment.variables {
+        println!("{key}={value}");
+    }
 
     Ok(())
 }
 
 async fn command_activate(args: ActivateArgs) -> Result<()> {
     match args.shell.as_str() {
-        "bash" | "zsh" => {
-            println!(
-                r#"_rah_hook() {{
-    eval "$(command rah env --shell {})"
+        "zsh" => {
+            print!(
+                r#"
+if [[ -z "${{__RAH_ORIG_PATH:-}}" ]]; then
+    export __RAH_ORIG_PATH="$PATH"
+fi
+
+typeset -g __RAH_LAST_PROJECT=""
+
+_rah_hook() {{
+    local project
+
+    project="$(command rah config --path 2>/dev/null)" || project=""
+
+    if [[ "$project" == "$__RAH_LAST_PROJECT" ]]; then
+        return
+    fi
+
+    __RAH_LAST_PROJECT="$project"
+
+    eval "$(command rah env --shell zsh)"
+
+    rehash
 }}
 
-rah() {{
-    command rah "$@"
+_rah_hook_chpwd() {{
     _rah_hook
 }}
 
-_rah_hook"#,
-                args.shell
+autoload -Uz add-zsh-hook
+add-zsh-hook chpwd _rah_hook_chpwd
+
+_rah_hook
+"#
+            );
+        }
+
+        "bash" => {
+            print!(
+                r#"
+if [[ -z "${{__RAH_ORIG_PATH:-}}" ]]; then
+    export __RAH_ORIG_PATH="$PATH"
+fi
+
+_rah_hook() {{
+    eval "$(command rah env --shell bash)"
+    hash -r
+}}
+
+_rah_hook
+"#
             );
         }
 
         "fish" => {
-            println!(
-                r#"function rah
-    command rah $argv
-    command rah env --shell fish | source
+            print!(
+                r#"
+if not set -q __RAH_ORIG_PATH
+    set -gx __RAH_ORIG_PATH $PATH
 end
 
-rah env --shell fish | source"#
+function __rah_hook --on-variable PWD
+    eval (command rah env --shell fish)
+end
+
+eval (command rah env --shell fish)
+"#
             );
         }
 
-        "powershell" | "pwsh" => {
-            println!(
-                r#"function rah {{
-    & rah @args
-    Invoke-Expression (& rah env --shell powershell)
+        "powershell" => {
+            print!(
+                r#"
+if (-not $env:__RAH_ORIG_PATH) {{
+    $env:__RAH_ORIG_PATH = $env:PATH
 }}
 
-Invoke-Expression (& rah env --shell powershell)"#
+function global:Invoke-RahHook {{
+    Invoke-Expression (rah env --shell powershell | Out-String)
+}}
+
+Invoke-RahHook
+"#
             );
         }
 

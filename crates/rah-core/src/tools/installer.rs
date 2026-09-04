@@ -35,8 +35,6 @@ impl ToolInstaller {
             return Ok(install_dir);
         }
 
-        // Install into a temporary directory first.
-        // This prevents partially-installed toolchains.
         let temp =
             tempfile::tempdir().context("failed to create temporary installation directory")?;
 
@@ -58,6 +56,64 @@ impl ToolInstaller {
         })?;
 
         Ok(install_dir)
+    }
+
+    /// Find an already-installed version without contacting a backend.
+    ///
+    /// This is intentionally synchronous and cheap because it is used by
+    /// `rah env` and shell hooks.
+    pub fn installed_path(&self, requirement: &ToolRequirement) -> Result<Option<PathBuf>> {
+        let home = dirs::home_dir().context("could not determine home directory")?;
+
+        let root = home
+            .join(".local")
+            .join("share")
+            .join("rah")
+            .join("installs")
+            .join(&requirement.name);
+
+        if !root.is_dir() {
+            return Ok(None);
+        }
+
+        // Exact version:
+        //
+        // github:BurntSushi/ripgrep@14.1.1
+        //
+        // becomes:
+        //
+        // installs/BurntSushi/ripgrep/14.1.1
+        if requirement.version != "latest" {
+            let exact = root.join(&requirement.version);
+
+            if exact.is_dir() {
+                return Ok(Some(exact));
+            }
+
+            return Ok(None);
+        }
+
+        // `latest` means:
+        // "find the newest version that Rah has already installed."
+        //
+        // This MUST NOT contact the backend.
+        let mut versions = Vec::new();
+
+        for entry in
+            fs::read_dir(&root).with_context(|| format!("failed to read {}", root.display()))?
+        {
+            let entry = entry?;
+
+            if !entry.path().is_dir() {
+                continue;
+            }
+
+            versions.push(entry.path());
+        }
+
+        versions.sort();
+
+        Ok(versions.pop())
     }
 }
 
@@ -87,11 +143,16 @@ fn install_path(requirement: &ToolRequirement, version: &ToolVersion) -> Result<
 /// the upstream project uses. Rah converts that layout into its
 /// own predictable structure here.
 fn normalize_installation(source: &Path, bin_dir: &Path) -> Result<()> {
+    fs::create_dir_all(bin_dir)
+        .with_context(|| format!("failed to create {}", bin_dir.display()))?;
+
     let files = collect_files(source)?;
 
     if files.is_empty() {
         anyhow::bail!("installation archive contained no files");
     }
+
+    let mut installed = 0;
 
     for file in files {
         let name = file
@@ -99,8 +160,15 @@ fn normalize_installation(source: &Path, bin_dir: &Path) -> Result<()> {
             .and_then(|name| name.to_str())
             .context("installation contains an invalid filename")?;
 
-        // Ignore obvious metadata/documentation files.
         if is_metadata(name) {
+            continue;
+        }
+
+        // On Unix, only install files that already have an
+        // executable bit. This prevents README/config/data files
+        // from being placed into bin/.
+        #[cfg(unix)]
+        if !is_executable(&file)? {
             continue;
         }
 
@@ -110,9 +178,24 @@ fn normalize_installation(source: &Path, bin_dir: &Path) -> Result<()> {
             .with_context(|| format!("failed to install {}", destination.display()))?;
 
         make_executable(&destination)?;
+
+        installed += 1;
+    }
+
+    if installed == 0 {
+        anyhow::bail!("installation archive contained no executable files");
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path)?;
+
+    Ok(metadata.permissions().mode() & 0o111 != 0)
 }
 
 fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
