@@ -1,2 +1,6 @@
-[project]
-name = "roobe-rah"
+[env]
+
+[settings]
+
+[tools]
+"github:BurntSushi/ripgrep" = "15.2.0"
