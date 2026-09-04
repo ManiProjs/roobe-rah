@@ -3,4 +3,4 @@
 [settings]
 
 [tools]
-"github:BurntSushi/ripgrep" = "15.2.0"
+"github:BurntSushi/ripgrep" = "latest"

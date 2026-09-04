@@ -153,11 +153,11 @@ struct WhichArgs {
 #[derive(Debug, Args)]
 struct ExecArgs {
     /// Optional tool/version override.
-    #[arg(value_name = "TOOL")]
+    #[arg(long)]
     tool: Option<String>,
 
     /// Command to execute.
-    #[arg(last = true, required = true)]
+    #[arg(required = true, trailing_var_arg = true)]
     command: Vec<String>,
 }
 
@@ -246,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Env(args) => command_env(args),
 
-        Commands::Activate(args) => command_activate(args),
+        Commands::Activate(args) => command_activate(args).await,
 
         Commands::Init => command_init(),
 
@@ -426,19 +426,25 @@ async fn command_exec(args: ExecArgs) -> Result<()> {
         anyhow::bail!("no command specified");
     }
 
-    let requirements = if let Some(tool) = &args.tool {
-        vec![ToolRequirement::parse(tool)?]
+    let project = Project::discover(".").context("could not find a project")?;
+
+    let requirements = discover_project_tools()?;
+
+    let requirements = if let Some(tool) = args.tool {
+        vec![ToolRequirement::parse(&tool)?]
     } else {
-        discover_project_tools()?
+        requirements
     };
 
-    let path = rah_core::tools::environment::build_path(&requirements).await?;
+    let environment = rah_core::tools::environment::resolve_environment(&requirements).await?;
 
     let mut command = std::process::Command::new(&args.command[0]);
 
-    command.args(&args.command[1..]);
+    command.args(&args.command[1..]).current_dir(&project.root);
 
-    command.env("PATH", path);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
 
     let status = command
         .status()
@@ -546,11 +552,44 @@ fn command_env(args: EnvArgs) -> Result<()> {
     Ok(())
 }
 
-fn command_activate(args: ActivateArgs) -> Result<()> {
+async fn command_activate(args: ActivateArgs) -> Result<()> {
     match args.shell.as_str() {
-        "bash" | "zsh" | "fish" | "powershell" | "pwsh" => {
-            println!("# Rah activation for {}", args.shell);
-            println!("# TODO: generate shell integration");
+        "bash" | "zsh" => {
+            println!(
+                r#"_rah_hook() {{
+    eval "$(command rah env --shell {})"
+}}
+
+rah() {{
+    command rah "$@"
+    _rah_hook
+}}
+
+_rah_hook"#,
+                args.shell
+            );
+        }
+
+        "fish" => {
+            println!(
+                r#"function rah
+    command rah $argv
+    command rah env --shell fish | source
+end
+
+rah env --shell fish | source"#
+            );
+        }
+
+        "powershell" | "pwsh" => {
+            println!(
+                r#"function rah {{
+    & rah @args
+    Invoke-Expression (& rah env --shell powershell)
+}}
+
+Invoke-Expression (& rah env --shell powershell)"#
+            );
         }
 
         shell => {
