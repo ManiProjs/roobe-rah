@@ -1,4 +1,5 @@
 [env]
+IS_PRODUCTION = "true"
 
 [settings]
 

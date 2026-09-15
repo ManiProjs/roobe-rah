@@ -434,14 +434,14 @@ async fn command_exec(args: ExecArgs) -> Result<()> {
         discover_project_tools()?
     };
 
-    let environment = rah_core::tools::environment::ensure_environment(&requirements).await?;
+    let environment = rah_core::tools::environment::resolve_environment(&requirements).await?;
 
     let command_name = &args.command[0];
 
     let executable = environment
         .executables
         .get(command_name)
-        .cloned()
+        .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(command_name));
 
     let mut command = std::process::Command::new(&executable);
@@ -480,7 +480,9 @@ fn discover_project_tools() -> Result<Vec<ToolRequirement>> {
     let mut requirements = Vec::new();
 
     for (name, value) in tools {
-        let version = value.as_str().context("tool version must be a string")?;
+        let version = value
+            .as_str()
+            .with_context(|| format!("tool `{name}` version must be a string"))?;
 
         let requirement = ToolRequirement::parse(&format!("{name}@{version}"))?;
 
@@ -536,41 +538,28 @@ fn command_prune() -> Result<()> {
 }
 
 async fn command_env(args: EnvArgs) -> Result<()> {
-    let requirements = match discover_project_tools() {
-        Ok(requirements) => requirements,
-        Err(error) => {
-            if args.json {
-                return Err(error);
-            }
+    let requirements = discover_project_tools()?;
 
-            if let Some(shell) = &args.shell {
-                let output = rah_core::tools::environment::shell_environment(&[], shell)?;
-
-                print!("{output}");
-                return Ok(());
-            }
-
-            return Err(error);
-        }
-    };
-
-    let environment = rah_core::tools::environment::resolve_environment(&requirements)?;
+    let environment = rah_core::tools::environment::resolve_environment(&requirements).await?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&environment)?);
-
         return Ok(());
     }
 
     if let Some(shell) = args.shell {
-        let output = rah_core::tools::environment::shell_environment(&requirements, &shell)?;
+        let output = rah_core::tools::environment::shell_environment(&requirements, &shell).await?;
 
         print!("{output}");
 
         return Ok(());
     }
 
-    for (key, value) in &environment.variables {
+    let mut variables = environment.variables.into_iter().collect::<Vec<_>>();
+
+    variables.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (key, value) in variables {
         println!("{key}={value}");
     }
 
@@ -612,6 +601,11 @@ autoload -Uz add-zsh-hook
 add-zsh-hook chpwd _rah_hook_chpwd
 
 _rah_hook
+
+# ==============================
+# Use `eval` to use Roobe Rah
+# eval "$(rah activate zsh)"
+# ==============================
 "#
             );
         }
