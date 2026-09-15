@@ -228,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Ls(args) => command_ls(args),
 
-        Commands::Current => command_current(),
+        Commands::Current => command_current().await,
 
         Commands::Which(args) => command_which(args),
 
@@ -404,11 +404,51 @@ fn command_ls(args: LsArgs) -> Result<()> {
     Ok(())
 }
 
-fn command_current() -> Result<()> {
+async fn command_current() -> Result<()> {
+    let requirements = discover_project_tools()?;
+
+    if requirements.is_empty() {
+        println!("No tools configured.");
+        return Ok(());
+    }
+
+    let environment = rah_core::tools::environment::resolve_environment(&requirements).await?;
+
     println!("Current tool versions:");
     println!();
 
-    // TODO: Resolve active workspace environment.
+    for requirement in &requirements {
+        let executable = environment.executables.get(&requirement.name);
+
+        match executable {
+            Some(path) => {
+                let version = std::process::Command::new(path).arg("--version").output();
+
+                match version {
+                    Ok(output) => {
+                        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+                        if text.is_empty() {
+                            println!("  {:<16} {}", requirement.name, requirement.version);
+                        } else {
+                            println!("  {:<16} {}", requirement.name, text);
+                        }
+                    }
+
+                    Err(_) => {
+                        println!("  {:<16} {}", requirement.name, requirement.version);
+                    }
+                }
+            }
+
+            None => {
+                println!(
+                    "  {:<16} {} (not found)",
+                    requirement.name, requirement.version
+                );
+            }
+        }
+    }
 
     Ok(())
 }
