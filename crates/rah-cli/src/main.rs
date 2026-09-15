@@ -226,11 +226,11 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Uninstall(args) => command_uninstall(args),
 
-        Commands::Ls(args) => command_ls(args),
+        Commands::Ls(args) => command_ls(args).await,
 
         Commands::Current => command_current().await,
 
-        Commands::Which(args) => command_which(args),
+        Commands::Which(args) => command_which(args).await,
 
         Commands::Exec(args) => command_exec(args).await,
 
@@ -386,20 +386,41 @@ fn command_uninstall(args: UninstallArgs) -> Result<()> {
     Ok(())
 }
 
-fn command_ls(args: LsArgs) -> Result<()> {
+async fn command_ls(args: LsArgs) -> Result<()> {
     if args.global {
-        println!("Global tools:");
-    } else if args.installed {
-        println!("Installed tools:");
-    } else {
-        println!("Project tools:");
+        anyhow::bail!("global tool listing is not implemented yet");
     }
 
-    if let Some(tool) = args.tool {
-        println!("Filter: {tool}");
+    let requirements = discover_project_tools()?;
+
+    if requirements.is_empty() {
+        println!("No tools configured.");
+        return Ok(());
     }
 
-    // TODO: Query ToolRegistry.
+    let environment = rah_core::tools::environment::resolve_environment(&requirements).await?;
+
+    println!("Project tools:");
+    println!();
+
+    for requirement in &requirements {
+        if let Some(filter) = &args.tool {
+            if requirement.name != *filter {
+                continue;
+            }
+        }
+
+        let status = if environment.executables.contains_key(&requirement.name) {
+            "installed"
+        } else {
+            "missing"
+        };
+
+        println!(
+            "  {:<16} {:<12} {}",
+            requirement.name, requirement.version, status
+        );
+    }
 
     Ok(())
 }
@@ -453,10 +474,23 @@ async fn command_current() -> Result<()> {
     Ok(())
 }
 
-fn command_which(args: WhichArgs) -> Result<()> {
-    println!("Looking for {}...", args.tool);
+async fn command_which(args: WhichArgs) -> Result<()> {
+    let requirements = discover_project_tools()?;
 
-    // TODO: Resolve tool and print executable path.
+    if requirements.is_empty() {
+        anyhow::bail!("no tools configured");
+    }
+
+    let environment = rah_core::tools::environment::resolve_environment(&requirements).await?;
+
+    let executable = environment.executables.get(&args.tool).ok_or_else(|| {
+        anyhow::anyhow!(
+            "tool `{}` is not available in the Rah environment",
+            args.tool
+        )
+    })?;
+
+    println!("{}", executable);
 
     Ok(())
 }
