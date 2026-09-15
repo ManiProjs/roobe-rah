@@ -97,6 +97,9 @@ enum Commands {
 
     /// Update Rah itself.
     SelfUpdate,
+
+    /// Start a shell inside the Rah environment.
+    Shell(ShellArgs),
 }
 
 #[derive(Debug, Args)]
@@ -215,6 +218,13 @@ struct CompletionArgs {
     shell: String,
 }
 
+#[derive(Debug, Args)]
+struct ShellArgs {
+    /// Shell to start.
+    #[arg(long)]
+    shell: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -269,6 +279,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Lock => command_lock(),
 
         Commands::SelfUpdate => command_self_update(),
+
+        Commands::Shell(args) => command_shell(args).await,
     }
 }
 
@@ -566,6 +578,139 @@ fn discover_project_tools() -> Result<Vec<ToolRequirement>> {
     Ok(requirements)
 }
 
+fn resolve_task_dependencies(
+    config: &rah_config::RahConfig,
+    task_name: &str,
+    order: &mut Vec<String>,
+    visiting: &mut std::collections::HashSet<String>,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    if visited.contains(task_name) {
+        return Ok(());
+    }
+
+    if !config.tasks.contains_key(task_name) {
+        anyhow::bail!("task `{task_name}` not found in rah.toml");
+    }
+
+    if !visiting.insert(task_name.to_string()) {
+        let mut cycle = visiting.iter().cloned().collect::<Vec<_>>();
+        cycle.push(task_name.to_string());
+
+        anyhow::bail!("task dependency cycle detected: {}", cycle.join(" -> "));
+    }
+
+    let task = config
+        .tasks
+        .get(task_name)
+        .expect("task existence checked above");
+
+    for dependency in &task.depends {
+        resolve_task_dependencies(config, dependency, order, visiting, visited)?;
+    }
+
+    visiting.remove(task_name);
+    visited.insert(task_name.to_string());
+    order.push(task_name.to_string());
+
+    Ok(())
+}
+
+fn execute_task(
+    project: &Project,
+    config: &rah_config::RahConfig,
+    task_name: &str,
+    command_line: &str,
+    args: &[String],
+) -> Result<()> {
+    let requirements = discover_project_tools()?;
+
+    let environment = futures::executor::block_on(
+        rah_core::tools::environment::resolve_environment(&requirements),
+    )?;
+
+    let shell = std::env::var("SHELL")
+        .ok()
+        .and_then(|shell| {
+            PathBuf::from(shell)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "sh".to_string());
+
+    let mut command = match shell.as_str() {
+        "zsh" => {
+            let mut command = std::process::Command::new("zsh");
+            command.arg("-lc");
+            command
+        }
+
+        "bash" => {
+            let mut command = std::process::Command::new("bash");
+            command.arg("-lc");
+            command
+        }
+
+        "fish" => {
+            let mut command = std::process::Command::new("fish");
+            command.arg("-c");
+            command
+        }
+
+        _ => {
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c");
+            command
+        }
+    };
+
+    let mut full_command = command_line.to_string();
+
+    for arg in args {
+        full_command.push(' ');
+        full_command.push_str(&shell_escape(arg));
+    }
+
+    command.arg(&full_command).current_dir(&project.root);
+
+    for (key, value) in &environment.variables {
+        command.env(key, value);
+    }
+
+    for (key, value) in &config.env {
+        command.env(key, value);
+    }
+
+    command.env("RAH_TASK", task_name);
+    command.env("RAH_PROJECT_ROOT", &project.root);
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to execute task `{task_name}`"))?;
+
+    if !status.success() {
+        anyhow::bail!("task `{task_name}` failed with {}", status);
+    }
+
+    Ok(())
+}
+
+fn shell_escape(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_-./:@%+=,".contains(c))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 async fn command_run(args: RunArgs) -> Result<()> {
     let project =
         Project::discover(".").context("could not find a project from the current directory")?;
@@ -573,139 +718,53 @@ async fn command_run(args: RunArgs) -> Result<()> {
     let config_path = project.root.join("rah.toml");
 
     if !config_path.exists() {
-        anyhow::bail!("no rah.toml found in {}", config_path.display());
+        anyhow::bail!("no rah.toml found in {}", project.root.display());
     }
 
-    let contents = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config = rah_config::load(&config_path)?;
 
-    let document: toml::Table = toml::from_str(&contents).context("failed to parse rah.toml")?;
+    if !config.tasks.contains_key(&args.task) {
+        anyhow::bail!("task `{}` not found in rah.toml", args.task);
+    }
 
-    let tasks = document
-        .get("tasks")
-        .and_then(|value| value.as_table())
-        .ok_or_else(|| anyhow::anyhow!("no tasks defined in rah.toml"))?;
-
-    let requirements = discover_project_tools()?;
-
-    let environment = rah_core::tools::environment::resolve_environment(&requirements).await?;
-
+    let mut order = Vec::new();
+    let mut visiting = std::collections::HashSet::new();
     let mut visited = std::collections::HashSet::new();
-    let mut active = std::collections::HashSet::new();
 
-    run_task(
-        &args.task,
-        tasks,
-        &args.args,
-        &project.root,
-        &environment,
-        &mut visited,
-        &mut active,
-    )?;
+    resolve_task_dependencies(&config, &args.task, &mut order, &mut visiting, &mut visited)?;
 
-    Ok(())
-}
+    println!();
 
-fn run_task(
-    name: &str,
-    tasks: &toml::map::Map<String, toml::Value>,
-    args: &[String],
-    project_root: &std::path::Path,
-    environment: &rah_core::tools::environment::ResolvedEnvironment,
-    visited: &mut std::collections::HashSet<String>,
-    active: &mut std::collections::HashSet<String>,
-) -> Result<()> {
-    if visited.contains(name) {
-        return Ok(());
-    }
+    for task_name in order {
+        let task = config
+            .tasks
+            .get(&task_name)
+            .with_context(|| format!("task `{task_name}` disappeared from configuration"))?;
 
-    // Detect circular dependencies.
-    if !active.insert(name.to_string()) {
-        anyhow::bail!("circular task dependency involving `{name}`");
-    }
+        let Some(command_line) = &task.run else {
+            println!("  {} has no command", task_name);
+            continue;
+        };
 
-    let task = tasks
-        .get(name)
-        .and_then(|value| value.as_table())
-        .ok_or_else(|| anyhow::anyhow!("task `{name}` not found"))?;
+        println!("  {} {}", Style::new().bold().apply_to("→"), task_name);
+        println!("    {}", command_line);
 
-    let dependencies = task
-        .get("depends")
-        .and_then(|value| value.as_array())
-        .map(|dependencies| {
-            dependencies
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .ok_or_else(|| anyhow::anyhow!("task `{name}` has a non-string dependency"))
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-
-    // Run dependencies first.
-    for dependency in dependencies {
-        run_task(
-            dependency,
-            tasks,
-            &[],
-            project_root,
-            environment,
-            visited,
-            active,
+        execute_task(
+            &project,
+            &config,
+            task_name.as_str(),
+            command_line,
+            if task_name == args.task {
+                &args.args
+            } else {
+                &[]
+            },
         )?;
     }
 
-    let run = task
-        .get("run")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| anyhow::anyhow!("task `{name}` has no `run` command"))?;
-
     println!();
-    println!(
-        "  {} {}",
-        console::style("▶").cyan(),
-        console::style(name).bold()
-    );
-
-    println!("    {}", console::style(run).dim());
-
-    let mut command = std::process::Command::new("sh");
-
-    command.arg("-c").arg(run).current_dir(project_root);
-
-    // Pass task arguments through.
-    //
-    // `$@` inside the task command can be used to access them.
-    command.args(args);
-
-    // Inject Rah's resolved environment.
-    for (key, value) in &environment.variables {
-        command.env(key, value);
-    }
-
-    let status = command
-        .status()
-        .with_context(|| format!("failed to execute task `{name}`"))?;
-
-    if !status.success() {
-        let code = status.code().unwrap_or(1);
-
-        active.remove(name);
-
-        anyhow::bail!("task `{name}` failed with exit code {code}");
-    }
-
-    visited.insert(name.to_string());
-    active.remove(name);
-
-    println!(
-        "    {} {}",
-        console::style("✓").green(),
-        console::style("done").green()
-    );
+    println!("  {}", Style::new().green().bold().apply_to("done"));
+    println!();
 
     Ok(())
 }
@@ -717,87 +776,44 @@ fn command_tasks() -> Result<()> {
     let config_path = project.root.join("rah.toml");
 
     if !config_path.exists() {
-        anyhow::bail!("no rah.toml found in {}", config_path.display());
+        anyhow::bail!("no rah.toml found in {}", project.root.display());
     }
 
-    let contents = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config = rah_config::load(&config_path)?;
 
-    let document: toml::Table = toml::from_str(&contents).context("failed to parse rah.toml")?;
+    if config.tasks.is_empty() {
+        println!("No tasks configured.");
+        println!();
+        println!("Add tasks to rah.toml:");
+        println!();
+        println!("  [tasks]");
+        println!("  dev = \"npm run dev\"");
+        println!("  test = \"npm test\"");
+        println!("  build = \"npm run build\"");
+        println!();
 
-    let Some(tasks) = document.get("tasks").and_then(|value| value.as_table()) else {
-        println!("No tasks defined.");
-        return Ok(());
-    };
-
-    if tasks.is_empty() {
-        println!("No tasks defined.");
         return Ok(());
     }
 
-    println!("Tasks:");
+    println!();
+    println!("Tasks");
     println!();
 
-    let mut names = tasks.keys().collect::<Vec<_>>();
-    names.sort();
+    for (name, task) in &config.tasks {
+        println!("  {}", Style::new().cyan().bold().apply_to(name));
 
-    for name in names {
-        let task = tasks
-            .get(name)
-            .and_then(|value| value.as_table())
-            .ok_or_else(|| anyhow::anyhow!("invalid task `{name}`"))?;
-
-        let run = task.get("run").and_then(|value| value.as_str());
-
-        let depends = task
-            .get("depends")
-            .and_then(|value| value.as_array())
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|value| value.as_str())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        match (run, depends.is_empty()) {
-            (Some(run), true) => {
-                println!(
-                    "  {:<16} {}",
-                    console::style(name).bold(),
-                    console::style(run).dim()
-                );
-            }
-
-            (Some(run), false) => {
-                println!(
-                    "  {:<16} {}",
-                    console::style(name).bold(),
-                    console::style(run).dim()
-                );
-
-                println!("  {:<16} depends: {}", "", depends.join(", "));
-            }
-
-            (None, false) => {
-                println!(
-                    "  {:<16} depends: {}",
-                    console::style(name).bold(),
-                    depends.join(", ")
-                );
-            }
-
-            (None, true) => {
-                println!(
-                    "  {:<16} {}",
-                    console::style(name).bold(),
-                    console::style("(no command)").dim()
-                );
-            }
+        if let Some(run) = &task.run {
+            println!("    {}", run);
+        } else {
+            println!("    {}", Style::new().dim().apply_to("(no command)"));
         }
-    }
 
-    println!();
+        if !task.depends.is_empty() {
+            println!("    depends: {}", task.depends.join(", "));
+        }
+
+        println!();
+    }
 
     Ok(())
 }
@@ -1149,6 +1165,103 @@ fn command_self_update() -> Result<()> {
     println!("Checking for Rah updates...");
 
     // TODO: Self-update implementation.
+
+    Ok(())
+}
+async fn command_shell(args: ShellArgs) -> Result<()> {
+    let project =
+        Project::discover(".").context("could not find a project from the current directory")?;
+
+    let requirements = discover_project_tools()?;
+
+    let environment = rah_core::tools::environment::resolve_environment(&requirements).await?;
+
+    let shell = match args.shell {
+        Some(shell) => shell,
+        None => std::env::var("SHELL")
+            .ok()
+            .and_then(|shell| {
+                PathBuf::from(shell)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "sh".to_string()),
+    };
+
+    let shell_path = match shell.as_str() {
+        "zsh" => "zsh",
+        "bash" => "bash",
+        "fish" => "fish",
+        "sh" => "sh",
+        "nu" => "nu",
+        other => {
+            anyhow::bail!("unsupported shell `{other}`");
+        }
+    };
+
+    println!("{}", Style::new().cyan().bold().apply_to("Roobe Rah shell"));
+
+    println!("  project: {}", project.root.display());
+
+    println!("  shell:   {}", shell_path);
+
+    if !requirements.is_empty() {
+        println!("  tools:");
+
+        for requirement in &requirements {
+            println!("    {}", requirement);
+        }
+    }
+
+    println!();
+
+    let mut command = std::process::Command::new(shell_path);
+
+    command.current_dir(&project.root);
+
+    // Apply Rah's resolved environment.
+    for (key, value) in environment.variables {
+        command.env(key, value);
+    }
+
+    // Apply project environment variables.
+    if let Ok(config_path) = rah_config::find(".").ok_or(()) {
+        let config = rah_config::load(&config_path)?;
+
+        for (key, value) in config.env {
+            command.env(key, value);
+        }
+    }
+
+    // Tell programs running inside the shell that Rah owns the environment.
+    command.env("RAH_SHELL", "1");
+    command.env("RAH_PROJECT_ROOT", &project.root);
+
+    // Make the prompt obvious.
+    match shell_path {
+        "zsh" => {
+            command.env("PROMPT", "(rah) %n@%m %1~ %# ");
+        }
+
+        "bash" => {
+            command.env("PS1", "(rah) \\u@\\h \\W \\$ ");
+        }
+
+        "fish" => {
+            command.env("fish_prompt", "(rah) ");
+        }
+
+        _ => {}
+    }
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to start {shell_path}"))?;
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
 
     Ok(())
 }
