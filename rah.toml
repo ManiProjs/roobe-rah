@@ -1,7 +1,9 @@
 [env]
 IS_PRODUCTION = "true"
 
-[settings]
+[tasks]
+run = { run = "cargo run" }
+build = { run = "cargo build" }
 
 [tools]
 "github:BurntSushi/ripgrep" = "latest"

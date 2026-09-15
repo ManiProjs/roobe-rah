@@ -234,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Exec(args) => command_exec(args).await,
 
-        Commands::Run(args) => command_run(args),
+        Commands::Run(args) => command_run(args).await,
 
         Commands::Tasks => command_tasks(),
 
@@ -566,23 +566,238 @@ fn discover_project_tools() -> Result<Vec<ToolRequirement>> {
     Ok(requirements)
 }
 
-fn command_run(args: RunArgs) -> Result<()> {
-    println!("Running task: {}", args.task);
+async fn command_run(args: RunArgs) -> Result<()> {
+    let project =
+        Project::discover(".").context("could not find a project from the current directory")?;
 
-    if !args.args.is_empty() {
-        println!("Arguments: {:?}", args.args);
+    let config_path = project.root.join("rah.toml");
+
+    if !config_path.exists() {
+        anyhow::bail!("no rah.toml found in {}", config_path.display());
     }
 
-    // TODO: Load rah.toml and execute task.
+    let contents = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+
+    let document: toml::Table = toml::from_str(&contents).context("failed to parse rah.toml")?;
+
+    let tasks = document
+        .get("tasks")
+        .and_then(|value| value.as_table())
+        .ok_or_else(|| anyhow::anyhow!("no tasks defined in rah.toml"))?;
+
+    let requirements = discover_project_tools()?;
+
+    let environment = rah_core::tools::environment::resolve_environment(&requirements).await?;
+
+    let mut visited = std::collections::HashSet::new();
+    let mut active = std::collections::HashSet::new();
+
+    run_task(
+        &args.task,
+        tasks,
+        &args.args,
+        &project.root,
+        &environment,
+        &mut visited,
+        &mut active,
+    )?;
+
+    Ok(())
+}
+
+fn run_task(
+    name: &str,
+    tasks: &toml::map::Map<String, toml::Value>,
+    args: &[String],
+    project_root: &std::path::Path,
+    environment: &rah_core::tools::environment::ResolvedEnvironment,
+    visited: &mut std::collections::HashSet<String>,
+    active: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    if visited.contains(name) {
+        return Ok(());
+    }
+
+    // Detect circular dependencies.
+    if !active.insert(name.to_string()) {
+        anyhow::bail!("circular task dependency involving `{name}`");
+    }
+
+    let task = tasks
+        .get(name)
+        .and_then(|value| value.as_table())
+        .ok_or_else(|| anyhow::anyhow!("task `{name}` not found"))?;
+
+    let dependencies = task
+        .get("depends")
+        .and_then(|value| value.as_array())
+        .map(|dependencies| {
+            dependencies
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("task `{name}` has a non-string dependency"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    // Run dependencies first.
+    for dependency in dependencies {
+        run_task(
+            dependency,
+            tasks,
+            &[],
+            project_root,
+            environment,
+            visited,
+            active,
+        )?;
+    }
+
+    let run = task
+        .get("run")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("task `{name}` has no `run` command"))?;
+
+    println!();
+    println!(
+        "  {} {}",
+        console::style("▶").cyan(),
+        console::style(name).bold()
+    );
+
+    println!("    {}", console::style(run).dim());
+
+    let mut command = std::process::Command::new("sh");
+
+    command.arg("-c").arg(run).current_dir(project_root);
+
+    // Pass task arguments through.
+    //
+    // `$@` inside the task command can be used to access them.
+    command.args(args);
+
+    // Inject Rah's resolved environment.
+    for (key, value) in &environment.variables {
+        command.env(key, value);
+    }
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to execute task `{name}`"))?;
+
+    if !status.success() {
+        let code = status.code().unwrap_or(1);
+
+        active.remove(name);
+
+        anyhow::bail!("task `{name}` failed with exit code {code}");
+    }
+
+    visited.insert(name.to_string());
+    active.remove(name);
+
+    println!(
+        "    {} {}",
+        console::style("✓").green(),
+        console::style("done").green()
+    );
 
     Ok(())
 }
 
 fn command_tasks() -> Result<()> {
+    let project =
+        Project::discover(".").context("could not find a project from the current directory")?;
+
+    let config_path = project.root.join("rah.toml");
+
+    if !config_path.exists() {
+        anyhow::bail!("no rah.toml found in {}", config_path.display());
+    }
+
+    let contents = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+
+    let document: toml::Table = toml::from_str(&contents).context("failed to parse rah.toml")?;
+
+    let Some(tasks) = document.get("tasks").and_then(|value| value.as_table()) else {
+        println!("No tasks defined.");
+        return Ok(());
+    };
+
+    if tasks.is_empty() {
+        println!("No tasks defined.");
+        return Ok(());
+    }
+
     println!("Tasks:");
     println!();
 
-    // TODO: Load tasks from rah.toml.
+    let mut names = tasks.keys().collect::<Vec<_>>();
+    names.sort();
+
+    for name in names {
+        let task = tasks
+            .get(name)
+            .and_then(|value| value.as_table())
+            .ok_or_else(|| anyhow::anyhow!("invalid task `{name}`"))?;
+
+        let run = task.get("run").and_then(|value| value.as_str());
+
+        let depends = task
+            .get("depends")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        match (run, depends.is_empty()) {
+            (Some(run), true) => {
+                println!(
+                    "  {:<16} {}",
+                    console::style(name).bold(),
+                    console::style(run).dim()
+                );
+            }
+
+            (Some(run), false) => {
+                println!(
+                    "  {:<16} {}",
+                    console::style(name).bold(),
+                    console::style(run).dim()
+                );
+
+                println!("  {:<16} depends: {}", "", depends.join(", "));
+            }
+
+            (None, false) => {
+                println!(
+                    "  {:<16} depends: {}",
+                    console::style(name).bold(),
+                    depends.join(", ")
+                );
+            }
+
+            (None, true) => {
+                println!(
+                    "  {:<16} {}",
+                    console::style(name).bold(),
+                    console::style("(no command)").dim()
+                );
+            }
+        }
+    }
+
+    println!();
 
     Ok(())
 }
